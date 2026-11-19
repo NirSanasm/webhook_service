@@ -1,0 +1,73 @@
+groups:
+  - name: webhook_delivery_alerts
+    interval: 60s
+    rules:
+      # Fires when the dead-letter rate exceeds 5 events per minute for 5 consecutive minutes
+      - alert: WebhookDeadLetterHigh
+        expr: rate(webhook_dead_lettered_total[1m]) * 60 > 5
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "High dead-letter rate detected"
+          description: >
+            The dead-letter rate is {{ printf "%.2f" $value }} events/min
+            (threshold: 5 events/min). Dead-lettered webhooks indicate
+            persistent delivery failures that require manual intervention.
+          runbook_url: "https://wiki.example.com/runbooks/webhook-dead-letter"
+          dashboard_url: "http://grafana:3000/d/webhook-overview"
+
+      # Fires when no worker has any active jobs for 10 consecutive minutes
+      - alert: WorkerNoActiveJobs
+        expr: sum(worker_active_jobs) == 0
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "No active jobs across all workers"
+          description: >
+            All delivery workers have been idle for more than 10 minutes.
+            This may indicate that workers have crashed, disconnected from
+            RabbitMQ, or the queue is genuinely empty during off-peak hours.
+          runbook_url: "https://wiki.example.com/runbooks/worker-idle"
+          dashboard_url: "http://grafana:3000/d/worker-rabbitmq"
+
+      # Fires when the outbox has more than 100 pending records for 5 consecutive minutes
+      - alert: OutboxBacklogHigh
+        expr: outbox_pending_records > 100
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Outbox backlog is growing"
+          description: >
+            The outbox currently has {{ $value }} pending records
+            (threshold: 100). A growing backlog may indicate that the
+            outbox publisher is falling behind or has stopped processing.
+          runbook_url: "https://wiki.example.com/runbooks/outbox-backlog"
+          dashboard_url: "http://grafana:3000/d/worker-rabbitmq"
+
+      # Fires when the delivery failure rate exceeds 20% over the past 5 minutes
+      - alert: HighDeliveryFailureRate
+        expr: >
+          (
+            rate(webhook_deliveries_failed_total[5m])
+            /
+            (rate(webhook_deliveries_total[5m]) > 0)
+          ) * 100 > 20
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "High webhook delivery failure rate"
+          description: >
+            The delivery failure rate is {{ printf "%.1f" $value }}%
+            over the past 5 minutes (threshold: 20%). This may indicate
+            widespread issues with downstream endpoints or internal delivery
+            infrastructure problems.
+          runbook_url: "https://wiki.example.com/runbooks/high-failure-rate"
+          dashboard_url: "http://grafana:3000/d/webhook-overview"

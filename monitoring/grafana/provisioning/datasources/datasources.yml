@@ -1,0 +1,85 @@
+apiVersion: 1
+
+datasources:
+  # Prometheus - default metrics datasource
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: "15s"
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
+          urlDisplayLabel: "View in Tempo"
+
+  # Loki - log aggregation datasource
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    isDefault: false
+    editable: true
+    jsonData:
+      maxLines: 1000
+      derivedFields:
+        - matcherRegex: '"trace_id":"(\w+)"'
+          name: TraceID
+          url: "$${__value.raw}"
+          datasourceUid: tempo
+          urlDisplayLabel: "View Trace in Tempo"
+        - matcherRegex: 'trace_id=(\w+)'
+          name: TraceID
+          url: "$${__value.raw}"
+          datasourceUid: tempo
+          urlDisplayLabel: "View Trace in Tempo"
+
+  # Tempo - distributed tracing datasource
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    isDefault: false
+    editable: true
+    jsonData:
+      httpMethod: GET
+      tracesToLogs:
+        datasourceUid: loki
+        tags:
+          - fromField: service.name
+            toLabel: service
+          - fromField: k8s.pod.name
+            toLabel: pod
+        mappedTags:
+          - fromField: service.name
+            toLabel: service
+        mapTagNamesEnabled: true
+        spanStartTimeShift: "-1m"
+        spanEndTimeShift: "1m"
+        filterByTraceID: true
+        filterBySpanID: false
+        lokiSearch: true
+      tracesToMetrics:
+        datasourceUid: prometheus
+        tags:
+          - fromField: service.name
+            toLabel: service
+        queries:
+          - name: "Request rate"
+            query: "rate(traces_spanmetrics_calls_total{$$__tags}[5m])"
+          - name: "Request duration P95"
+            query: "histogram_quantile(0.95, rate(traces_spanmetrics_duration_milliseconds_bucket{$$__tags}[5m]))"
+      serviceMap:
+        datasourceUid: prometheus
+      search:
+        hide: false
+      nodeGraph:
+        enabled: true
+      lokiSearch:
+        datasourceUid: loki

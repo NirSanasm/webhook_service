@@ -1,0 +1,100 @@
+// ============================================================
+// Grafana Alloy configuration — Webhook Delivery Lab
+// Collects container logs via Docker and forwards to Loki.
+// ============================================================
+
+// Discover Docker containers
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+// Relabel: use container name and compose service as labels
+discovery.relabel "docker_containers" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/?(.*)"
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "project"
+  }
+}
+
+// Collect logs from Docker containers
+loki.source.docker "docker_logs" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.docker_containers.output
+  forward_to = [loki.process.pipeline.receiver]
+}
+
+// Process and enrich log entries
+loki.process "pipeline" {
+  // Parse structured JSON logs
+  stage.json {
+    expressions = {
+      level       = "level",
+      service     = "service_name",
+      trace_id    = "trace_id",
+      span_id     = "span_id",
+      message     = "message",
+      http_method = "http_method",
+      http_path   = "http_path",
+      status_code = "status_code",
+    }
+  }
+
+  // Promote parsed fields to Loki stream labels
+  stage.labels {
+    values = {
+      level   = "",
+      service = "",
+    }
+  }
+
+  // Extract trace_id as a structured metadata field (not label)
+  // so Grafana can link logs → Tempo traces
+  stage.structured_metadata {
+    values = {
+      trace_id = "",
+      span_id  = "",
+    }
+  }
+
+  // Normalise log level to lowercase
+  stage.label_drop {
+    values = []
+  }
+
+  // Drop debug logs in production to reduce cardinality
+  stage.drop {
+    source     = "level"
+    expression = "(?i)debug"
+  }
+
+  forward_to = [loki.write.local_loki.receiver]
+}
+
+// Write processed logs to local Loki instance
+loki.write "local_loki" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+
+    // Batch settings
+    batch_wait = "1s"
+    batch_size = 1048576  // 1 MiB
+  }
+
+  external_labels = {
+    environment = "local",
+    project     = "webhook-delivery-lab",
+  }
+}

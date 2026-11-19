@@ -1,0 +1,319 @@
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — primary database
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: webhookdb
+      POSTGRES_USER: webhook
+      POSTGRES_PASSWORD: webhook
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U webhook -d webhookdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - webhook_net
+
+  # ---------------------------------------------------------------------------
+  # RabbitMQ — message broker with management UI and Prometheus plugin
+  # ---------------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: webhook
+      RABBITMQ_DEFAULT_PASS: webhook
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI
+      - "15692:15692"  # Prometheus metrics plugin
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      # Mount enabled_plugins so rabbitmq_prometheus is active from first boot.
+      # The management-alpine image ships the plugin but doesn't enable it by default.
+      - ./monitoring/rabbitmq/enabled_plugins:/etc/rabbitmq/enabled_plugins:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - webhook_net
+
+  # ---------------------------------------------------------------------------
+  # API Service
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://webhook:webhook@postgres:5432/webhookdb
+      RABBITMQ_URL: amqp://webhook:webhook@rabbitmq:5672/
+      OTEL_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: webhook-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      - webhook_net
+
+  # ---------------------------------------------------------------------------
+  # Delivery Worker
+  # ---------------------------------------------------------------------------
+  delivery-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    command: python scripts/run_worker.py
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://webhook:webhook@postgres:5432/webhookdb
+      RABBITMQ_URL: amqp://webhook:webhook@rabbitmq:5672/
+      OTEL_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: webhook-worker
+      WORKER_ID: worker-1
+      WORKER_CONCURRENCY: "5"
+      RABBITMQ_PREFETCH_COUNT: "10"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - webhook_net
+
+  # ---------------------------------------------------------------------------
+  # Outbox Publisher
+  # ---------------------------------------------------------------------------
+  outbox-publisher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: outbox
+    command: python scripts/run_outbox.py
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://webhook:webhook@postgres:5432/webhookdb
+      RABBITMQ_URL: amqp://webhook:webhook@rabbitmq:5672/
+      OTEL_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: outbox-publisher
+      OUTBOX_POLL_INTERVAL_SECONDS: "5"
+      OUTBOX_BATCH_SIZE: "50"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - webhook_net
+
+  # ---------------------------------------------------------------------------
+  # Mock Receiver Service
+  # ---------------------------------------------------------------------------
+  receiver:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: receiver
+    command: uvicorn receiver.main:app --host 0.0.0.0 --port 8001
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      RECEIVER_FLAKY_FAIL_COUNT: "3"
+      RECEIVER_SLOW_DELAY_SECONDS: "10.0"
+      RECEIVER_RATE_LIMIT_WAIT_SECONDS: "5"
+      RECEIVER_TIMEOUT_DELAY_SECONDS: "60.0"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    networks:
+      - webhook_net
+
+  # ---------------------------------------------------------------------------
+  # Database Migrations (init container)
+  # ---------------------------------------------------------------------------
+  migrations:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: migrations
+    command: alembic upgrade head
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://webhook:webhook@postgres:5432/webhookdb
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - webhook_net
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Prometheus
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.console.libraries=/etc/prometheus/console_libraries"
+      - "--web.console.templates=/etc/prometheus/consoles"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+    networks:
+      - webhook_net
+
+  # ---------------------------------------------------------------------------
+  # Grafana
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.3.1
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_FEATURE_TOGGLES_ENABLE: "traceqlEditor"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    restart: unless-stopped
+    networks:
+      - webhook_net
+
+  # ---------------------------------------------------------------------------
+  # OpenTelemetry Collector
+  # ---------------------------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.114.0
+    command: ["--config=/etc/otel-collector.yml"]
+    volumes:
+      - ./monitoring/otel-collector/otel-collector.yml:/etc/otel-collector.yml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # OTel Collector metrics
+      - "8889:8889"   # Prometheus exporter (scraped by Prometheus)
+    restart: unless-stopped
+    networks:
+      - webhook_net
+
+  # ---------------------------------------------------------------------------
+  # Grafana Tempo — distributed tracing backend
+  # ---------------------------------------------------------------------------
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ["-config.file=/etc/tempo.yml"]
+    volumes:
+      - ./monitoring/tempo/tempo.yml:/etc/tempo.yml:ro
+      - tempo_data:/tmp/tempo
+    ports:
+      - "3200:3200"   # Tempo HTTP
+      - "4317"        # Internal OTLP (not exposed to host)
+    restart: unless-stopped
+    networks:
+      - webhook_net
+
+  # ---------------------------------------------------------------------------
+  # Grafana Loki — log aggregation
+  # ---------------------------------------------------------------------------
+  loki:
+    image: grafana/loki:3.2.1
+    command: ["-config.file=/etc/loki.yml"]
+    volumes:
+      - ./monitoring/loki/loki.yml:/etc/loki.yml:ro
+      - loki_data:/tmp/loki
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
+    networks:
+      - webhook_net
+
+  # ---------------------------------------------------------------------------
+  # Grafana Alloy — container log collector
+  # ---------------------------------------------------------------------------
+  alloy:
+    image: grafana/alloy:v1.5.1
+    command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./monitoring/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "12345:12345"  # Alloy UI
+    depends_on:
+      - loki
+    restart: unless-stopped
+    networks:
+      - webhook_net
+
+# ---------------------------------------------------------------------------
+# Named volumes
+# ---------------------------------------------------------------------------
+volumes:
+  postgres_data:
+  rabbitmq_data:
+  prometheus_data:
+  grafana_data:
+  tempo_data:
+  loki_data:
+
+# ---------------------------------------------------------------------------
+# Network
+# ---------------------------------------------------------------------------
+networks:
+  webhook_net:
+    driver: bridge
+

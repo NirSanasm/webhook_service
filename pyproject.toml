@@ -1,0 +1,79 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "webhook-delivery-lab"
+version = "0.1.0"
+description = "A complete webhook delivery and observability laboratory"
+requires-python = ">=3.12"
+dependencies = [
+    # Web framework
+    "fastapi==0.115.5",
+    "uvicorn[standard]==0.32.1",
+    # Pydantic
+    "pydantic==2.10.3",
+    "pydantic-settings==2.6.1",
+    # Database
+    "sqlalchemy==2.0.36",
+    "alembic==1.14.0",
+    "asyncpg==0.30.0",
+    # Message broker
+    "aio-pika==9.5.1",
+    # HTTP client
+    "httpx==0.28.1",
+    # Observability
+    "opentelemetry-api==1.29.0",
+    "opentelemetry-sdk==1.29.0",
+    "opentelemetry-exporter-otlp-proto-grpc==1.29.0",
+    "opentelemetry-instrumentation-fastapi==0.50b0",
+    "opentelemetry-instrumentation-httpx==0.50b0",
+    "opentelemetry-instrumentation-sqlalchemy==0.50b0",
+    "opentelemetry-instrumentation-asyncpg==0.50b0",
+    "prometheus-client==0.21.1",
+    # Utilities
+    "python-json-logger==3.2.1",
+    "python-ulid==3.0.0",
+    "tenacity==9.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+    "pytest-asyncio==0.24.0",
+    "pytest-cov==6.0.0",
+    "httpx==0.28.1",
+    "ruff==0.8.4",
+    "mypy==1.13.0",
+    "types-python-jose",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app", "receiver"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "unit: Unit tests (no external dependencies)",
+    "integration: Integration tests (requires running infrastructure)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = false
+ignore_missing_imports = true
+
